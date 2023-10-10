@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -39,73 +38,95 @@ func main() {
 	}
 
 	for _, dirConfig := range config.Directories {
-		files, err := os.ReadDir(dirConfig.Path)
+		err := processDirectoryRecursively(dirConfig, logger)
 		if err != nil {
-			logger.Println("Błąd odczytu katalogu:", err)
+			logger.Printf("Błąd przetwarzania katalogu %s: %v", dirConfig.Path, err)
+		}
+	}
+}
+
+func processDirectoryRecursively(dirConfig DirectoryConfig, logger *log.Logger) error {
+	return processDirectory(dirConfig.Path, dirConfig.MaxSizeMB, logger)
+}
+
+func processDirectory(path string, maxSizeMB int64, logger *log.Logger) error {
+	files, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+
+	var totalSize int64
+	for _, file := range files {
+		info, err := file.Info()
+		if err != nil {
+			logger.Println("Błąd pobierania informacji o pliku:", err)
 			continue
 		}
+		totalSize += info.Size()
+	}
 
-		var totalSize int64
-		for _, file := range files {
-			info, err := file.Info()
-			if err != nil {
-				logger.Println("Błąd pobierania informacji o pliku:", err)
-				continue
-			}
-			totalSize += info.Size()
+	maxDirectorySizeBytes := maxSizeMB * 1024 * 1024
+	freedSpace := int64(0)
+
+	for totalSize > maxDirectorySizeBytes {
+		if len(files) == 0 {
+			break
 		}
 
-		maxDirectorySizeBytes := dirConfig.MaxSizeMB * 1024 * 1024
-		freedSpace := int64(0)
+		for i := 0; i < len(files); i++ {
+			oldestFile := files[i]
+			oldestFileIndex := i
 
-		for totalSize > maxDirectorySizeBytes {
-			if len(files) == 0 {
-				break
-			}
-
-			for i := 0; i < len(files); i++ {
-				oldestFile := files[i]
-				oldestFileIndex := i
-
-				for j := i + 1; j < len(files); j++ {
-					infoI, err := oldestFile.Info()
-					infoJ, err := files[j].Info()
-					if err != nil {
-						logger.Println("Błąd pobierania informacji o pliku:", err)
-						continue
-					}
-					if infoJ.ModTime().Before(infoI.ModTime()) {
-						oldestFile = files[j]
-						oldestFileIndex = j
-					}
-				}
-
-				filePath := filepath.Join(dirConfig.Path, oldestFile.Name())
-				err := os.Remove(filePath)
-				if err != nil {
-					logger.Println("Błąd usuwania pliku:", err)
-					return
-				}
-
-				info, err := oldestFile.Info()
+			for j := i + 1; j < len(files); j++ {
+				infoI, err := oldestFile.Info()
+				infoJ, err := files[j].Info()
 				if err != nil {
 					logger.Println("Błąd pobierania informacji o pliku:", err)
 					continue
 				}
-
-				totalSize -= info.Size()
-				freedSpace += info.Size()
-				files = append(files[:oldestFileIndex], files[oldestFileIndex+1:]...)
-				logger.Printf("Usunięto plik: %s\n", oldestFile.Name())
-
-				if totalSize <= maxDirectorySizeBytes {
-					break
+				if infoJ.ModTime().Before(infoI.ModTime()) {
+					oldestFile = files[j]
+					oldestFileIndex = j
 				}
 			}
-		}
 
-		logger.Printf("Zwolniono %d MB w katalogu %s\n", freedSpace/(1024*1024), dirConfig.Path)
+			filePath := filepath.Join(path, oldestFile.Name())
+			err := os.Remove(filePath)
+			if err != nil {
+				// Obsługa błędu przy próbie usunięcia pliku
+				logger.Printf("Błąd usuwania pliku %s: %v", oldestFile.Name(), err)
+				continue
+			}
+
+			info, err := oldestFile.Info()
+			if err != nil {
+				logger.Println("Błąd pobierania informacji o pliku:", err)
+				continue
+			}
+
+			totalSize -= info.Size()
+			freedSpace += info.Size()
+			files = append(files[:oldestFileIndex], files[oldestFileIndex+1:]...)
+			logger.Printf("Usunięto plik: %s\n", oldestFile.Name())
+
+			if totalSize <= maxDirectorySizeBytes {
+				break
+			}
+		}
 	}
+
+	logger.Printf("Zwolniono %d MB w katalogu %s\n", freedSpace/(1024*1024), path)
+	for _, file := range files {
+		if file.IsDir() {
+			subDirPath := filepath.Join(path, file.Name())
+			err := processDirectory(subDirPath, maxSizeMB, logger)
+			if err != nil {
+				logger.Printf("Błąd przetwarzania podkatalogu %s: %v", subDirPath, err)
+			}
+		}
+	}
+
+	return nil
 }
 
 func readConfig(filename string) (Config, error) {
@@ -121,15 +142,14 @@ func readConfig(filename string) (Config, error) {
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		if err == io.EOF {
-			break
-		}
-
 		line := scanner.Text()
 		parts := strings.Split(line, "=")
 		if len(parts) == 2 {
 			key := strings.TrimSpace(parts[0])
 			value := strings.TrimSpace(parts[1])
+
+			// Zmiana znaków ukośnika w ścieżce
+			value = strings.ReplaceAll(value, "\\ ", "\\")
 
 			switch key {
 			case "directory_path":
@@ -140,7 +160,6 @@ func readConfig(filename string) (Config, error) {
 					return config, err
 				}
 				currentDirectory.MaxSizeMB = sizeMB
-				config.Directories = append(config.Directories, currentDirectory)
 			}
 		}
 	}
@@ -148,6 +167,8 @@ func readConfig(filename string) (Config, error) {
 	if err := scanner.Err(); err != nil {
 		return config, err
 	}
+
+	config.Directories = append(config.Directories, currentDirectory)
 
 	return config, nil
 }
